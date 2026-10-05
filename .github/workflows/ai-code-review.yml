@@ -1,121 +1,290 @@
 name: AI Code Review
 
 on:
-  push:
-    branches:
-      - main
+push:
+branches:
+- main
 
 permissions:
-  contents: read
-  issues: write
+contents: read
+issues: write
 
 jobs:
-  ai-review:
-    runs-on: ubuntu-latest
+ai-review:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Collect changed code
-        shell: bash
-        run: |
-          git diff --name-only HEAD^ HEAD > changed_files.txt
-          : > code.txt
-
-          while IFS= read -r file; do
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
+    with:
+      fetch-depth: 2
+  - name: Collect changed code
+    shell: bash
+    env:
+      BEFORE_SHA: ${{ github.event.before }}
+      AFTER_SHA: ${{ github.sha }}
+    run: |
+      set -euo pipefail
+      if [ -z "${BEFORE_SHA:-}" ] || [ -z "${AFTER_SHA:-}" ]; then
+        echo "Missing required GitHub event commit SHA values." >&2
+        exit 1
+      fi
+      if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+        git ls-tree -r --name-only "$AFTER_SHA" > changed_files.txt
+      else
+        git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" > changed_files.txt
+      fi
+      : > code.txt
+      while IFS= read -r file; do
+        case "$file" in
+          *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cpp|*.c|*.h|*.cs|*.swift|*.kt|*.kts)
             case "$file" in
-              *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cpp|*.c|*.h|*.cs|*.swift|*.kt|*.kts)
-                if [ -f "$file" ]; then
-                  case "$file" in
-                    .env*|*secret*|*credential*|*password*|*node_modules/*)
-                      continue
-                      ;;
-                  esac
-
-                  size=$(wc -c < "$file")
-
-                  if [ "$size" -le 50000 ]; then
-                    echo "" >> code.txt
-                    echo "===== FILE: $file =====" >> code.txt
-                    cat "$file" >> code.txt
-                  fi
-                fi
+              .env*|*secret*|*credential*|*password*|*token*|*.pem|*.key|*node_modules/*|*dist/*|*build/*)
+                continue
                 ;;
             esac
-          done < changed_files.txt
-
-      - name: Ask GPT
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import urllib.request
-
-          with open("code.txt", "r", encoding="utf-8") as f:
-              code = f.read()
-
-          if not code.strip():
-              result = """# AI Code Review
-
-          ไม่มีไฟล์โค้ดที่รองรับถูกเปลี่ยนแปลงในการ Push ครั้งนี้
-          """
-          else:
-              code = code[:120000]
-
-              prompt = f"""
-          ตรวจสอบโค้ดที่เพิ่งถูก Push ขึ้น GitHub
-
-          งาน:
-          1. ตรวจคำผิดใน comments, strings และข้อความต่าง ๆ
-          2. ตรวจ syntax ที่เห็นได้ชัด
-          3. ตรวจ bug และโค้ดที่อาจทำงานผิดพลาด
-          4. สรุปหน้าที่ของแต่ละไฟล์
-          5. ระบุปัญหาที่ควรแก้จากสำคัญมากไปน้อย
-          6. บอกสิ่งที่ทำได้ดี
-          7. ห้ามแก้ไขโค้ดเอง
-          8. ถ้าไม่พบปัญหา ให้ระบุว่าไม่พบปัญหาสำคัญ
-
-          ตอบเป็น Markdown ภาษาไทย
-
-          โค้ด:
-          {code}
-          """
-
-              payload = {
-                  "model": "gpt-6-luna",
-                  "input": prompt
-              }
-
+            if [ -f "$file" ]; then
+              size=$(wc -c < "$file")
+              if [ "$size" -le 50000 ]; then
+                {
+                  echo ""
+                  echo "===== FILE: $file ====="
+                  cat "$file"
+                } >> code.txt
+              fi
+            fi
+            ;;
+        esac
+      done < changed_files.txt
+  - name: Ask GPT
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-6-luna
+      OPENAI_API_URL: https://api.openai.com/v1/responses
+      OPENAI_TIMEOUT_SECONDS: "120"
+      OPENAI_MAX_RETRIES: "5"
+    shell: bash
+    run: |
+      set -euo pipefail
+      if [ -z "${OPENAI_API_KEY:-}" ]; then
+        echo "OPENAI_API_KEY is not configured." >&2
+        exit 1
+      fi
+      python - <<'PY'
+      import json
+      import os
+      import random
+      import socket
+      import time
+      import urllib.error
+      import urllib.request
+      def required_env(name: str) -> str:
+          value = os.environ.get(name, "").strip()
+          if not value:
+              raise RuntimeError(f"Required environment variable is missing: {name}")
+          return value
+      def positive_int_env(name: str, default: int) -> int:
+          raw_value = os.environ.get(name, str(default)).strip()
+          try:
+              value = int(raw_value)
+          except ValueError as exc:
+              raise RuntimeError(
+                  f"Environment variable {name} must be an integer."
+              ) from exc
+          if value <= 0:
+              raise RuntimeError(
+                  f"Environment variable {name} must be greater than zero."
+              )
+          return value
+      def extract_output_text(data: object) -> str:
+          if not isinstance(data, dict):
+              raise RuntimeError("OpenAI response must be a JSON object.")
+          output_text = data.get("output_text")
+          if isinstance(output_text, str) and output_text.strip():
+              return output_text.strip()
+          output = data.get("output")
+          if not isinstance(output, list):
+              raise RuntimeError(
+                  "OpenAI response has no valid output_text or output array."
+              )
+          text_parts = []
+          for item in output:
+              if not isinstance(item, dict):
+                  continue
+              content = item.get("content")
+              if not isinstance(content, list):
+                  continue
+              for content_item in content:
+                  if not isinstance(content_item, dict):
+                      continue
+                  text = content_item.get("text")
+                  if isinstance(text, str) and text.strip():
+                      text_parts.append(text.strip())
+          result = "\n".join(text_parts).strip()
+          if not result:
+              raise RuntimeError(
+                  "OpenAI response contained no readable text output."
+              )
+          return result
+      def is_retryable_status(status: int) -> bool:
+          return status in {408, 409, 429} or status >= 500
+      def retry_delay(attempt: int, retry_after: str | None) -> float:
+          if retry_after:
+              try:
+                  return max(0.0, min(float(retry_after), 60.0))
+              except ValueError:
+                  pass
+          base_delay = min(60.0, 2 ** attempt)
+          return base_delay + random.uniform(0.0, 1.0)
+      api_key = required_env("OPENAI_API_KEY")
+      model = required_env("OPENAI_MODEL")
+      api_url = required_env("OPENAI_API_URL")
+      timeout_seconds = positive_int_env("OPENAI_TIMEOUT_SECONDS", 120)
+      max_retries = positive_int_env("OPENAI_MAX_RETRIES", 5)
+      with open("code.txt", "r", encoding="utf-8") as file:
+          code = file.read()
+      if not code.strip():
+          result = """# AI Code Review
+      ไม่มีไฟล์โค้ดที่รองรับถูกเปลี่ยนแปลงในการ Push ครั้งนี้
+      """
+      else:
+          code = code[:120000]
+          prompt = f"""
+      คุณเป็น AI Code Reviewer
+      ตรวจสอบโค้ดที่เพิ่งถูก Push ขึ้น GitHub
+      งาน:
+      1. ตรวจคำผิดใน comments, strings และข้อความต่าง ๆ
+      2. ตรวจ syntax ที่เห็นได้ชัด
+      3. ตรวจ bug และโค้ดที่อาจทำงานผิดพลาด
+      4. สรุปหน้าที่ของแต่ละไฟล์
+      5. ระบุปัญหาที่ควรแก้จากสำคัญมากไปน้อย
+      6. บอกสิ่งที่ทำได้ดี
+      7. ห้ามแก้ไขโค้ดเอง ให้รายงานผลเท่านั้น
+      8. ถ้าไม่พบปัญหาสำคัญ ให้ระบุอย่างชัดเจน
+      ตอบเป็น Markdown ภาษาไทย
+      โค้ด:
+      {code}
+      """
+          payload = {
+              "model": model,
+              "input": prompt
+          }
+          request_body = json.dumps(payload).encode("utf-8")
+          result = None
+          for attempt in range(max_retries + 1):
               request = urllib.request.Request(
-                  "https://api.openai.com/v1/responses",
-                  data=json.dumps(payload).encode("utf-8"),
+                  api_url,
+                  data=request_body,
                   headers={
-                      "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
-                      "Content-Type": "application/json"
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/json"
                   },
                   method="POST"
               )
-
-              with urllib.request.urlopen(request) as response:
-                  data = json.loads(response.read().decode("utf-8"))
-
-              result = data.get("output_text", "")
-
-          with open("ai_review.md", "w", encoding="utf-8") as f:
-              f.write(result)
-          PY
-
-      - name: Create GitHub Issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          gh issue create \
-            --title "AI Code Review - ${{ github.sha }}" \
-            --body-file ai_review.md
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=timeout_seconds
+                  ) as response:
+                      raw_body = response.read().decode("utf-8")
+                      data = json.loads(raw_body)
+                      result = extract_output_text(data)
+                      break
+              except urllib.error.HTTPError as error:
+                  response_body = error.read().decode(
+                      "utf-8",
+                      errors="replace"
+                  )
+                  if not is_retryable_status(error.code):
+                      raise RuntimeError(
+                          f"OpenAI API returned non-retryable HTTP "
+                          f"{error.code}: {response_body[:2000]}"
+                      ) from error
+                  if attempt >= max_retries:
+                      raise RuntimeError(
+                          f"OpenAI API failed after {max_retries + 1} "
+                          f"attempts with HTTP {error.code}: "
+                          f"{response_body[:2000]}"
+                      ) from error
+                  delay = retry_delay(
+                      attempt,
+                      error.headers.get("Retry-After")
+                  )
+                  print(
+                      f"Retryable OpenAI HTTP error {error.code}. "
+                      f"Retrying in {delay:.1f} seconds "
+                      f"(attempt {attempt + 1}/{max_retries})."
+                  )
+                  time.sleep(delay)
+              except urllib.error.URLError as error:
+                  if attempt >= max_retries:
+                      raise RuntimeError(
+                          f"OpenAI API network request failed after "
+                          f"{max_retries + 1} attempts: {error}"
+                      ) from error
+                  delay = retry_delay(attempt, None)
+                  print(
+                      f"Temporary OpenAI network error: {error}. "
+                      f"Retrying in {delay:.1f} seconds "
+                      f"(attempt {attempt + 1}/{max_retries})."
+                  )
+                  time.sleep(delay)
+              except (TimeoutError, socket.timeout) as error:
+                  if attempt >= max_retries:
+                      raise RuntimeError(
+                          f"OpenAI API request timed out after "
+                          f"{max_retries + 1} attempts: {error}"
+                      ) from error
+                  delay = retry_delay(attempt, None)
+                  print(
+                      f"OpenAI request timed out: {error}. "
+                      f"Retrying in {delay:.1f} seconds "
+                      f"(attempt {attempt + 1}/{max_retries})."
+                  )
+                  time.sleep(delay)
+              except json.JSONDecodeError as error:
+                  if attempt >= max_retries:
+                      raise RuntimeError(
+                          "OpenAI returned malformed JSON after "
+                          f"{max_retries + 1} attempts."
+                      ) from error
+                  delay = retry_delay(attempt, None)
+                  print(
+                      "OpenAI returned malformed JSON. "
+                      f"Retrying in {delay:.1f} seconds "
+                      f"(attempt {attempt + 1}/{max_retries})."
+                  )
+                  time.sleep(delay)
+              except RuntimeError as error:
+                  if attempt >= max_retries:
+                      raise
+                  delay = retry_delay(attempt, None)
+                  print(
+                      f"Invalid or incomplete OpenAI response: {error}. "
+                      f"Retrying in {delay:.1f} seconds "
+                      f"(attempt {attempt + 1}/{max_retries})."
+                  )
+                  time.sleep(delay)
+          if not result:
+              raise RuntimeError("OpenAI returned an empty review.")
+      with open("ai_review.md", "w", encoding="utf-8") as file:
+          file.write(result)
+      PY
+  - name: Create GitHub Issue
+    env:
+      GH_TOKEN: ${{ github.token }}
+    shell: bash
+    run: |
+      set -euo pipefail
+      if [ -z "${GH_TOKEN:-}" ]; then
+        echo "GH_TOKEN is not available." >&2
+        exit 1
+      fi
+      if [ ! -s ai_review.md ]; then
+        echo "AI review file is missing or empty." >&2
+        exit 1
+      fi
+      gh issue create \
+        --title "AI Code Review - ${{ github.sha }}" \
+        --body-file ai_review.md
