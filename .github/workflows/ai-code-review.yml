@@ -54,8 +54,7 @@ steps:
       with open("code.txt", "r", encoding="utf-8") as f:
           code = f.read()
       if not code.strip():
-          result = """# AI Code Review
-      ไม่มีไฟล์โค้ดที่รองรับถูกเปลี่ยนแปลงในการ Push ครั้งนี้"""
+          result = "# AI Code Review\n\nไม่มีไฟล์โค้ดที่รองรับถูกเปลี่ยนแปลงในการ Push ครั้งนี้"
       else:
           code = code[:120000]
           prompt = f"""
