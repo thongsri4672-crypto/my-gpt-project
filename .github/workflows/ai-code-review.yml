@@ -3,17 +3,19 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 permissions:
   contents: read
   issues: write
 jobs:
   ai-review:
+    name: Review pushed code with GPT
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Collect changed code
         shell: bash
         env:
@@ -29,17 +31,17 @@ jobs:
           : > code.txt
           while IFS= read -r file; do
             case "$file" in
-              .env*|*secret*|*credential*|*password*|*token*|*.pem|*.key|*node_modules/*|*dist/*|*build/*)
+              .env|.env.*|*secret*|*credential*|*password*|*token*|*.pem|*.key|*.p12|*.pfx|*node_modules/*|*dist/*|*build/*|*.lock)
                 continue
                 ;;
             esac
             case "$file" in
-              *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cpp|*.c|*.h|*.cs|*.swift|*.kt|*.kts|*.json|*.yaml|*.yml|*.md)
+              *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cpp|*.c|*.h|*.cs|*.swift|*.kt|*.kts|*.json|*.yaml|*.yml|*.md|*.html|*.css)
                 if [ -f "$file" ]; then
                   size=$(wc -c < "$file")
                   if [ "$size" -le 50000 ]; then
                     {
-                      echo ""
+                      echo
                       echo "===== FILE: $file ====="
                       cat "$file"
                     } >> code.txt
@@ -48,18 +50,27 @@ jobs:
                 ;;
             esac
           done < changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+          echo "Collected code size: $(wc -c < code.txt) bytes"
+      - name: Check OpenAI secret
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY repository secret is not configured."
+            exit 1
+          fi
       - name: Ask GPT
+        shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-6-luna
           OPENAI_API_URL: https://api.openai.com/v1/responses
-        shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "OPENAI_API_KEY is not configured."
-            exit 1
-          fi
           python - <<'PY'
           import json
           import os
@@ -75,18 +86,27 @@ jobs:
           else:
               code = code[:120000]
               prompt = f"""
-          คุณเป็น AI Code Reviewer
+          คุณเป็น AI Code Reviewer สำหรับโปรเจกต์ GitHub
           ตรวจสอบโค้ดที่เพิ่งถูก Push ขึ้น GitHub
-          งาน:
-          1. ตรวจคำผิดใน comments, strings และข้อความต่าง ๆ
-          2. ตรวจ syntax ที่เห็นได้ชัด
-          3. ตรวจ bug และโค้ดที่อาจทำงานผิดพลาด
-          4. สรุปหน้าที่ของแต่ละไฟล์
-          5. ระบุปัญหาที่ควรแก้จากสำคัญมากไปน้อย
-          6. บอกสิ่งที่ทำได้ดี
-          7. ห้ามแก้ไขโค้ดเอง ให้รายงานผลเท่านั้น
-          8. ถ้าไม่พบปัญหาสำคัญ ให้ระบุอย่างชัดเจน
-          ตอบเป็น Markdown ภาษาไทย
+          งานที่ต้องทำ:
+          1. ตรวจคำผิดใน comments, strings และข้อความที่ผู้ใช้เห็น
+          2. ตรวจ syntax และข้อผิดพลาดที่เห็นได้ชัด
+          3. ตรวจ bug และ logic ที่อาจทำงานผิดพลาด
+          4. ตรวจปัญหาด้านความปลอดภัยที่เห็นได้จากโค้ด
+          5. สรุปหน้าที่ของแต่ละไฟล์ที่เปลี่ยน
+          6. ระบุปัญหาที่ควรแก้ โดยเรียง Critical, High, Medium, Low
+          7. บอกสิ่งที่ทำได้ดี
+          8. ถ้าไม่พบปัญหาสำคัญ ให้ระบุชัดเจน
+          9. ห้ามแก้ไขโค้ดเอง ให้รายงานผลเท่านั้น
+          10. ห้ามเปิดเผยหรือสร้างค่าความลับ เช่น API keys, tokens หรือ passwords
+          ตอบเป็น Markdown ภาษาไทย โดยใช้รูปแบบ:
+          # AI Code Review
+          ## สรุป
+          ## ไฟล์ที่เปลี่ยน
+          ## คำผิด
+          ## ปัญหาและความเสี่ยง
+          ## สิ่งที่ทำได้ดี
+          ## ข้อเสนอแนะ
           โค้ด:
           {code}
           """
@@ -104,6 +124,7 @@ jobs:
                   },
                   method="POST"
               )
+              result = ""
               last_error = None
               for attempt in range(5):
                   try:
@@ -114,14 +135,18 @@ jobs:
                           data = json.loads(
                               response.read().decode("utf-8")
                           )
-                      result = data.get("output_text", "").strip()
+                      result = data.get(
+                          "output_text",
+                          ""
+                      ).strip()
                       if not result:
+                          parts = []
                           for item in data.get("output", []):
                               for part in item.get("content", []):
                                   text = part.get("text")
                                   if isinstance(text, str):
-                                      result += text.strip() + "\n"
-                      result = result.strip()
+                                      parts.append(text)
+                          result = "\n".join(parts).strip()
                       if not result:
                           raise RuntimeError(
                               "OpenAI returned an empty response."
@@ -145,19 +170,30 @@ jobs:
                   raise RuntimeError(
                       f"OpenAI request failed: {last_error}"
                   )
-          with open("ai_review.md", "w", encoding="utf-8") as f:
+          with open(
+              "ai_review.md",
+              "w",
+              encoding="utf-8"
+          ) as f:
               f.write(result)
           PY
-      - name: Create GitHub Issue
+      - name: Create GitHub Issue with review
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
           set -euo pipefail
           if [ ! -s ai_review.md ]; then
-            echo "AI review is empty."
+            echo "::error::AI review is empty."
             exit 1
           fi
+          {
+            echo "# Automated AI Code Review"
+            echo
+            echo "**Commit:** ${{ github.sha }}"
+            echo
+            cat ai_review.md
+          } > issue_body.md
           gh issue create \
             --title "AI Code Review - ${{ github.sha }}" \
-            --body-file ai_review.md
+            --body-file issue_body.md
