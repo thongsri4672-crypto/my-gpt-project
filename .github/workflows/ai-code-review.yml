@@ -1,101 +1,99 @@
 name: AI Code Review
-
 on:
-push:
-branches:
-- main
-
+  push:
+    branches:
+      - main
 permissions:
-contents: read
-issues: write
-
+  contents: read
+  issues: write
 jobs:
-ai-review:
-runs-on: ubuntu-latest
-
-steps:
-  - name: Checkout
-    uses: actions/checkout@v4
-    with:
-      fetch-depth: 2
-  - name: Collect changed code
-    shell: bash
-    run: |
-      git diff --name-only HEAD^ HEAD > changed_files.txt
-      : > code.txt
-      while IFS= read -r file; do
-        case "$file" in
-          *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cpp|*.c|*.h|*.cs|*.swift|*.kt|*.kts)
-            if [ -f "$file" ]; then
-              case "$file" in
-                .env*|*secret*|*credential*|*password*|*node_modules/*)
-                  continue
-                  ;;
-              esac
-              size=$(wc -c < "$file")
-              if [ "$size" -le 50000 ]; then
-                echo "" >> code.txt
-                echo "===== FILE: $file =====" >> code.txt
-                cat "$file" >> code.txt
-              fi
-            fi
-            ;;
-        esac
-      done < changed_files.txt
-  - name: Ask GPT
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    shell: bash
-    run: |
-      python - <<'PY'
-      import json
-      import os
-      import urllib.request
-      with open("code.txt", "r", encoding="utf-8") as f:
-          code = f.read()
-      if not code.strip():
-          result = "# AI Code Review\n\nไม่มีไฟล์โค้ดที่รองรับถูกเปลี่ยนแปลงในการ Push ครั้งนี้"
-      else:
-          code = code[:120000]
-          prompt = f"""
-      ตรวจสอบโค้ดที่เพิ่งถูก Push ขึ้น GitHub
-      งาน:
-      1. ตรวจคำผิดใน comments, strings และข้อความต่าง ๆ
-      2. ตรวจ syntax ที่เห็นได้ชัด
-      3. ตรวจ bug และโค้ดที่อาจทำงานผิดพลาด
-      4. สรุปหน้าที่ของแต่ละไฟล์
-      5. ระบุปัญหาที่ควรแก้จากสำคัญมากไปน้อย
-      6. บอกสิ่งที่ทำได้ดี
-      7. ห้ามแก้ไขโค้ดเอง
-      8. ถ้าไม่พบปัญหา ให้ระบุว่าไม่พบปัญหาสำคัญ
-      ตอบเป็น Markdown ภาษาไทย
-      โค้ด:
-      {code}
-      """
-          payload = {
-              "model": "gpt-6-luna",
-              "input": prompt
-          }
-          request = urllib.request.Request(
-              "https://api.openai.com/v1/responses",
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
-                  "Content-Type": "application/json"
-              },
-              method="POST"
-          )
-          with urllib.request.urlopen(request) as response:
-              data = json.loads(response.read().decode("utf-8"))
-          result = data.get("output_text", "")
-      with open("ai_review.md", "w", encoding="utf-8") as f:
-          f.write(result)
-      PY
-  - name: Create GitHub Issue
-    env:
-      GH_TOKEN: ${{ github.token }}
-    shell: bash
-    run: |
-      gh issue create \
-        --title "AI Code Review - ${{ github.sha }}" \
-        --body-file ai_review.md
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Collect changed code
+        shell: bash
+        run: |
+          git diff --name-only HEAD^ HEAD > changed_files.txt
+          : > code.txt
+          while IFS= read -r file; do
+            case "$file" in
+              *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cpp|*.c|*.h|*.cs|*.swift|*.kt|*.kts)
+                if [ -f "$file" ]; then
+                  case "$file" in
+                    .env*|*secret*|*credential*|*password*|*node_modules/*)
+                      continue
+                      ;;
+                  esac
+                  size=$(wc -c < "$file")
+                  if [ "$size" -le 50000 ]; then
+                    echo "" >> code.txt
+                    echo "===== FILE: $file =====" >> code.txt
+                    cat "$file" >> code.txt
+                  fi
+                fi
+                ;;
+            esac
+          done < changed_files.txt
+      - name: Ask GPT
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+          with open("code.txt", "r", encoding="utf-8") as f:
+              code = f.read()
+          if not code.strip():
+              result = """# AI Code Review
+          ไม่มีไฟล์โค้ดที่รองรับถูกเปลี่ยนแปลงในการ Push ครั้งนี้
+          """
+          else:
+              code = code[:120000]
+              prompt = f"""
+          ตรวจสอบโค้ดที่เพิ่งถูก Push ขึ้น GitHub
+          งาน:
+          1. ตรวจคำผิดใน comments, strings และข้อความต่าง ๆ
+          2. ตรวจ syntax ที่เห็นได้ชัด
+          3. ตรวจ bug และโค้ดที่อาจทำงานผิดพลาด
+          4. สรุปหน้าที่ของแต่ละไฟล์
+          5. ระบุปัญหาที่ควรแก้จากสำคัญมากไปน้อย
+          6. บอกสิ่งที่ทำได้ดี
+          7. ห้ามแก้ไขโค้ดเอง
+          8. ถ้าไม่พบปัญหา ให้ระบุว่าไม่พบปัญหาสำคัญ
+          ตอบเป็น Markdown ภาษาไทย
+          โค้ด:
+          {code}
+          """
+              payload = {
+                  "model": "gpt-6-luna",
+                  "input": prompt
+              }
+              request = urllib.request.Request(
+                  "https://api.openai.com/v1/responses",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+              with urllib.request.urlopen(request) as response:
+                  data = json.loads(response.read().decode("utf-8"))
+              result = data.get("output_text", "")
+          with open("ai_review.md", "w", encoding="utf-8") as f:
+              f.write(result)
+          PY
+      - name: Create GitHub Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue create \
+            --title "AI Code Review - ${{ github.sha }}" \
+            --body-file ai_review.md
