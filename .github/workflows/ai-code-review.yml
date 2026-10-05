@@ -1,0 +1,244 @@
+name: AI Code Review
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed files
+        id: changes
+        shell: bash
+        run: |
+          set -e
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.sha }}"
+
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              git ls-files > changed_files.txt
+            else
+              git diff --name-only "$BEFORE" "$AFTER" > changed_files.txt
+            fi
+          else
+            git ls-files > changed_files.txt
+          fi
+
+          grep -Ev \
+            '(^|/)(\.env|\.env\..*|node_modules|\.git|dist|build|coverage|\.next|vendor)/|(\.lock$|package-lock\.json$|yarn\.lock$|pnpm-lock\.yaml$)' \
+            changed_files.txt > filtered_files.txt || true
+
+          mv filtered_files.txt changed_files.txt
+
+          echo "Changed files:"
+          cat changed_files.txt
+
+      - name: Build review input
+        shell: bash
+        run: |
+          set -e
+
+          : > review_input.txt
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            [ -f "$file" ] || continue
+
+            case "$file" in
+              *.js|*.jsx|*.ts|*.tsx|*.py|*.java|*.go|*.rs|*.php|*.rb|*.cs|*.cpp|*.c|*.h|*.html|*.css|*.scss|*.json|*.md|*.txt|*.yml|*.yaml)
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            SIZE=$(wc -c < "$file")
+
+            if [ "$SIZE" -gt 51200 ]; then
+              echo "===== FILE: $file (SKIPPED: >50KB) =====" >> review_input.txt
+              continue
+            fi
+
+            echo "===== FILE: $file =====" >> review_input.txt
+            cat "$file" >> review_input.txt
+            echo -e "\n" >> review_input.txt
+          done < changed_files.txt
+
+          if [ ! -s review_input.txt ]; then
+            echo "No supported files to review." > review_input.txt
+          fi
+
+      - name: Check Groq API key
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "ERROR: GROQ_API_KEY is not configured."
+            exit 1
+          fi
+
+      - name: AI Code Review
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: openai/gpt-oss-20b
+          GROQ_API_URL: https://api.groq.com/openai/v1/chat/completions
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+
+          api_key = os.environ["GROQ_API_KEY"]
+          model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+          api_url = os.environ.get(
+              "GROQ_API_URL",
+              "https://api.groq.com/openai/v1/chat/completions"
+          )
+
+          with open("review_input.txt", "r", encoding="utf-8") as f:
+              code = f.read()
+
+          system_prompt = """
+          คุณคือ Senior Software Engineer และ Code Reviewer
+
+          ตรวจสอบโค้ดที่ได้รับอย่างละเอียด
+
+          ให้ตรวจ:
+          1. Syntax errors
+          2. Runtime bugs
+          3. Logic bugs
+          4. Security vulnerabilities
+          5. API/key/secret exposure
+          6. Performance problems
+          7. Bad architecture
+          8. Typo หรือ configuration errors
+          9. Dependency problems
+          10. จุดที่อาจทำให้ GitHub Actions / Vercel build ล้มเหลว
+
+          ห้ามเปิดเผย secret, API key, token หรือ credential ใด ๆ
+          ห้ามแก้ไขโค้ด
+          ให้คำแนะนำที่สามารถนำไปแก้ไขได้จริง
+
+          ตอบเป็นภาษาไทยใน Markdown
+
+          รูปแบบ:
+
+          # AI Code Review
+
+          ## สรุป
+          ระบุภาพรวมของโค้ด
+
+          ## ปัญหาที่พบ
+          สำหรับแต่ละปัญหาให้ระบุ:
+          - ระดับ: CRITICAL / HIGH / MEDIUM / LOW
+          - ไฟล์
+          - ปัญหา
+          - วิธีแก้
+
+          ## Security
+          ระบุปัญหาด้านความปลอดภัย
+
+          ## จุดที่ทำได้ดี
+          ระบุข้อดี
+
+          ## คำแนะนำ
+          ระบุสิ่งที่ควรปรับปรุง
+
+          ## สรุปสุดท้าย
+          ระบุว่าโค้ดพร้อมใช้งานหรือไม่
+          """
+
+          user_prompt = f"""
+          ตรวจสอบไฟล์ต่อไปนี้:
+
+          {code}
+          """
+
+          payload = {
+              "model": model,
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": system_prompt
+                  },
+                  {
+                      "role": "user",
+                      "content": user_prompt
+                  }
+              ],
+              "temperature": 0.1,
+              "max_tokens": 6000
+          }
+
+          data = json.dumps(payload).encode("utf-8")
+
+          request = urllib.request.Request(
+              api_url,
+              data=data,
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  result = json.loads(response.read().decode("utf-8"))
+          except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8", errors="replace")
+              print("Groq API error:")
+              print(body)
+              raise
+
+          choices = result.get("choices", [])
+
+          if not choices:
+              raise RuntimeError("Groq returned no choices.")
+
+          review = choices[0]["message"]["content"]
+
+          with open("ai_review.md", "w", encoding="utf-8") as f:
+              f.write(review)
+
+          print(review)
+          PY
+
+      - name: Create GitHub Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ ! -s ai_review.md ]; then
+            echo "No AI review generated."
+            exit 1
+          fi
+
+          {
+            echo "## AI Code Review"
+            echo
+            echo "**Commit:** ${{ github.sha }}"
+            echo
+            cat ai_review.md
+          } > issue_body.md
+
+          gh issue create \
+            --title "AI Code Review - ${{ github.sha }}" \
+            --body-file issue_body.md
